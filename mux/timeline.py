@@ -29,6 +29,28 @@ class MuxError(Exception):
     """封装过程中不可恢复的错误（非法配置、越界偏移、非法时间轴、批量回滚等）。"""
 
 
+def _round_div(num, den):
+    """round(num / den)，四舍五入、半个向上，纯整数运算，支持负数分子。"""
+    return (2 * num + den) // (2 * den)
+
+
+def _ms(ticks, timescale):
+    """把 tick 换算成整数毫秒（四舍五入），纯整数运算。"""
+    return _round_div(ticks * 1000, timescale)
+
+
+def _require_timescale(timescale):
+    if not isinstance(timescale, int) or timescale <= 0:
+        raise MuxError(f"非法时间基 timescale={timescale!r}：必须为正整数")
+
+
+def _as_track_list(tracks):
+    """单条轨道 dict 归一化成列表；列表原样返回。"""
+    if isinstance(tracks, dict):
+        return [tracks]
+    return list(tracks)
+
+
 def to_common_timescale(track, target):
     """把整条轨道的样本换算到目标时间基。
 
@@ -56,7 +78,20 @@ def to_common_timescale(track, target):
     * ``target <= 0`` 或 ``timescale <= 0`` 抛 :class:`MuxError`。
     * ``samples`` 为空返回 ``[]``。
     """
-    raise NotImplementedError
+    _require_timescale(target)
+    timescale = track["timescale"]
+    _require_timescale(timescale)
+
+    out = []
+    for sample in track["samples"]:
+        pts = sample["pts"]
+        start = _round_div(pts * target, timescale)
+        end = _round_div((pts + sample["dur"]) * target, timescale)
+        item = {"pts": start, "dur": end - start}
+        if "keyframe" in sample:
+            item["keyframe"] = sample["keyframe"]
+        out.append(item)
+    return out
 
 
 def align_offset(video, audio, max_shift_ms):
@@ -87,7 +122,36 @@ def align_offset(video, audio, max_shift_ms):
     * 任一轨为空或没有可用参考点抛 :class:`MuxError`。
     * 结果落在 1 帧（≈33 ms）容差内即视为对齐成功。
     """
-    raise NotImplementedError
+    if max_shift_ms < 0:
+        raise MuxError(f"max_shift_ms 必须 >= 0，当前为 {max_shift_ms}")
+
+    video_samples = video["samples"]
+    audio_samples = audio["samples"]
+    if not video_samples:
+        raise MuxError(f"视频轨 {video.get('track_id')} 为空，没有可用参考点")
+    if not audio_samples:
+        raise MuxError(f"音频轨 {audio.get('track_id')} 为空，没有可用参考点")
+
+    _require_timescale(video["timescale"])
+    _require_timescale(audio["timescale"])
+
+    ref_video = None
+    for sample in video_samples:
+        if sample.get("keyframe", False):
+            ref_video = sample
+            break
+    if ref_video is None:
+        ref_video = video_samples[0]
+
+    offset = _ms(audio_samples[0]["pts"], audio["timescale"]) - _ms(
+        ref_video["pts"], video["timescale"]
+    )
+    if abs(offset) > max_shift_ms:
+        raise MuxError(
+            f"音视频偏移 {offset} ms 超出 max_shift_ms={max_shift_ms}："
+            f"video={video.get('track_id')} audio={audio.get('track_id')}"
+        )
+    return offset
 
 
 def interleave(video, audio, window_ms):
@@ -116,7 +180,31 @@ def interleave(video, audio, window_ms):
     * 同一 ``t_ms`` 的视频样本排在音频样本之前。
     * ``window_ms <= 0`` 抛 :class:`MuxError`；两轨都空返回 ``[]``。
     """
-    raise NotImplementedError
+    if window_ms <= 0:
+        raise MuxError(f"window_ms 必须 > 0，当前为 {window_ms}")
+
+    keyed = []
+    for track_order, track in enumerate((video, audio)):
+        timescale = track["timescale"]
+        _require_timescale(timescale)
+        for index, sample in enumerate(track["samples"]):
+            t_ms = _ms(sample["pts"], timescale)
+            keyed.append(
+                (
+                    t_ms // window_ms,
+                    t_ms,
+                    track_order,
+                    index,
+                    {
+                        "track_id": track["track_id"],
+                        "pts": sample["pts"],
+                        "dur": sample["dur"],
+                        "t_ms": t_ms,
+                    },
+                )
+            )
+    keyed.sort(key=lambda entry: entry[:4])
+    return [entry[4] for entry in keyed]
 
 
 def detect_gaps(track, max_gap_ms):
@@ -146,7 +234,34 @@ def detect_gaps(track, max_gap_ms):
     * 样本按 pts 排序后再检测，输入顺序不影响结果。
     * ``max_gap_ms < 0`` 抛 :class:`MuxError`；空轨道返回 ``[]``。
     """
-    raise NotImplementedError
+    if max_gap_ms < 0:
+        raise MuxError(f"max_gap_ms 必须 >= 0，当前为 {max_gap_ms}")
+
+    intervals = []
+    for one in _as_track_list(track):
+        timescale = one["timescale"]
+        _require_timescale(timescale)
+        for sample in one["samples"]:
+            start = _ms(sample["pts"], timescale)
+            end = _ms(sample["pts"] + sample["dur"], timescale)
+            intervals.append((start, end))
+    if not intervals:
+        return []
+
+    intervals.sort()
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    gaps = []
+    for prev, nxt in zip(merged, merged[1:]):
+        gap_ms = nxt[0] - prev[1]
+        if gap_ms > max_gap_ms:
+            gaps.append((prev[1], nxt[0], gap_ms))
+    return gaps
 
 
 def compute_duration(tracks):
@@ -169,7 +284,15 @@ def compute_duration(tracks):
     * 误差允许 1 tick（≈1 ms 量级），换算用整数运算。
     * ``timescale <= 0`` 抛 :class:`MuxError`。
     """
-    raise NotImplementedError
+    longest = 0
+    for track in _as_track_list(tracks):
+        timescale = track["timescale"]
+        _require_timescale(timescale)
+        for sample in track["samples"]:
+            end_ms = _ms(sample["pts"] + sample["dur"], timescale)
+            if end_ms > longest:
+                longest = end_ms
+    return longest
 
 
 def edit_list(track, cuts):
@@ -200,7 +323,44 @@ def edit_list(track, cuts):
     * ``cuts`` 非升序、含负数、越界或首元素不是 0 抛 :class:`MuxError`。
     * ``samples`` 为空或 ``cuts`` 为空返回 ``[]``。
     """
-    raise NotImplementedError
+    samples = track["samples"]
+    if not samples or not cuts:
+        return []
+
+    timescale = track["timescale"]
+    _require_timescale(timescale)
+
+    if cuts[0] != 0:
+        raise MuxError(f"cuts 首元素必须是 0，当前为 {cuts[0]}")
+    prev = -1
+    for cut in cuts:
+        if cut < 0:
+            raise MuxError(f"cuts 含负数切点：{cut}")
+        if cut <= prev:
+            raise MuxError(f"cuts 必须严格升序：{cuts}")
+        if cut >= len(samples):
+            raise MuxError(f"cuts 越界：{cut} >= 样本数 {len(samples)}")
+        prev = cut
+
+    # 样本 dur 的前缀和：cum[i] 是第 i 个样本的起点（tick）。
+    cum = [0] * (len(samples) + 1)
+    for i, sample in enumerate(samples):
+        cum[i + 1] = cum[i] + sample["dur"]
+
+    boundaries = list(cuts) + [len(samples)]
+    entries = []
+    media_offset = 0
+    for start, end in zip(boundaries, boundaries[1:]):
+        duration_ms = _ms(cum[end], timescale) - _ms(cum[start], timescale)
+        entries.append(
+            {
+                "start_index": start,
+                "duration_ms": duration_ms,
+                "media_offset_ms": media_offset,
+            }
+        )
+        media_offset += duration_ms
+    return entries
 
 
 def validate_timeline(tracks):
@@ -229,7 +389,33 @@ def validate_timeline(tracks):
     * 一条轨可以同时报多条问题；同一问题不重复报。
     * 空列表返回 ``[]``；``timescale <= 0`` 抛 :class:`MuxError`。
     """
-    raise NotImplementedError
+    problems = []
+    tracks = list(tracks)
+    if not tracks:
+        return problems
+
+    reference = None
+    for track in tracks:
+        timescale = track["timescale"]
+        _require_timescale(timescale)
+        if reference is None:
+            reference = timescale
+        track_id = track["track_id"]
+        if timescale != reference:
+            problems.append(f"timescale_mismatch:{track_id}")
+        duration_ticks = track.get("duration_ticks")
+        for index, sample in enumerate(track["samples"]):
+            pts = sample["pts"]
+            dur = sample["dur"]
+            if pts < 0:
+                problems.append(f"negative_pts:{track_id}:{index}")
+            if dur <= 0:
+                problems.append(f"invalid_duration:{track_id}:{index}")
+            if duration_ticks is not None and (
+                pts >= duration_ticks or pts + dur > duration_ticks
+            ):
+                problems.append(f"out_of_range:{track_id}:{index}")
+    return problems
 
 
 def mux_batch(jobs, config):
@@ -276,4 +462,40 @@ def mux_batch(jobs, config):
       求和；同一 ``job_id`` 重复或 ``tracks`` 为空抛 :class:`MuxError`。
     * ``config`` 缺键用默认值，多余键忽略。
     """
-    raise NotImplementedError
+    config = config or {}
+    max_gap_ms = config.get("max_gap_ms", 1000)
+    if max_gap_ms < 0:
+        raise MuxError(f"max_gap_ms 必须 >= 0，当前为 {max_gap_ms}")
+
+    jobs = list(jobs)
+    seen_ids = set()
+    for job in jobs:
+        job_id = job["job_id"]
+        if job_id in seen_ids:
+            raise MuxError(f"重复的 job_id：{job_id}")
+        seen_ids.add(job_id)
+        if not job["tracks"]:
+            raise MuxError(f"任务 {job_id} 没有任何轨道")
+
+    # 先整体校验：任一任务有问题即整体回滚，不产生部分结果。
+    for job in jobs:
+        problems = validate_timeline(job["tracks"])
+        if problems:
+            raise MuxError(f"任务 {job['job_id']} 时间轴非法：{problems[0]}")
+
+    results = []
+    total = 0
+    for job in jobs:
+        tracks = job["tracks"]
+        duration_ms = compute_duration(tracks)
+        results.append(
+            {
+                "job_id": job["job_id"],
+                "duration_ms": duration_ms,
+                "item_count": sum(len(t["samples"]) for t in tracks),
+                "gap_count": len(detect_gaps(tracks, max_gap_ms)),
+                "tracks": [t["track_id"] for t in tracks],
+            }
+        )
+        total += duration_ms
+    return {"jobs": results, "total_duration_ms": total}
